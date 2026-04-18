@@ -14,8 +14,14 @@ httpx>=0.28.0
 # Google Generative AI
 google-generativeai>=0.8.0
 
+# Groq LLM Provider
+groq>=0.22.0
+
 # Data validation
 pydantic>=2.10.0
 
 # Utilities
 python-dotenv>=1.0.0
+
+# Retry logic
+tenacity>=9.0.0

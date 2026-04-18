@@ -41,6 +41,8 @@ Do NOT invent, guess, or hallucinate tool names.
 
 7. issue_refund(order_id: str, amount: float, reason: str)
    → Process a refund. ALWAYS call check_refund_eligibility first.
+   ⚠️ CRITICAL: 'amount' MUST be a NUMBER (e.g., 129.99), NOT a string reference.
+   Use the exact dollar value from the order, NOT "step_2_result.amount".
 
 8. cancel_order(order_id: str)
    → Cancel an order. Only works for orders in 'processing' status.
@@ -62,13 +64,16 @@ Do NOT invent, guess, or hallucinate tool names.
 SHOPWAVE POLICY REFRESHER:
 - Returns allowed within 30 days of delivery
 - Refund processing time: 5-7 business days
+- VIP (Tier 3): +15 day extended return window, priority handling
+- Premium (Tier 2): +7 day extended return window
 
 PLANNING RULES:
 1. BE CONCISE: Avoid 'over-planning'. If a ticket requires escalation (e.g., warranty check), don't gather 5 pieces of info if 2 are enough to justify the escalation.
-2. PARAMETERS: Use exact values from the ticket when possible. Avoid generic placeholders like '{{customer_id}}' if you can reference specific order IDs like 'ORD-123' directly.
+2. PARAMETERS: Use EXACT VALUES from the ticket when possible. For issue_refund, the 'amount' parameter MUST be a literal number (e.g., 129.99), NOT a string like "step_2_result.amount".
 3. DEPENDENCIES: Ensure tool order is logical. lookup_customer_by_email -> get_order -> check_refund_eligibility -> issue_refund.
 4. REFLECTION: If provided with 'execution_context', analyze why the previous plan failed and fix it specifically.
 5. OUTPUT FORMAT: Raw JSON only. No markdown. No comments. No trailing commas.
+6. RISK AWARENESS: If RISK INTELLIGENCE is provided below, factor it into your plan (VIP privileges, threat handling, fraud caution).
 
 OUTPUT FORMAT (strict JSON, no markdown fences):
 {
@@ -94,10 +99,14 @@ OUTPUT FORMAT (strict JSON, no markdown fences):
     retry=retry_if_exception_type(Exception),
     reraise=True
 )
-async def run_planner(ticket: dict, execution_context: dict | None = None) -> dict:
-    """Analyze a ticket and produce an execution plan."""
+async def run_planner(ticket: dict, execution_context: dict | None = None, risk_context: str | None = None) -> dict:
+    """Analyze a ticket and produce an execution plan with risk-aware intelligence."""
     prompt = f"TICKET DATA:\n{json.dumps(ticket, indent=2)}"
-    
+
+    # Inject risk intelligence if available
+    if risk_context and risk_context != "No risk signals detected.":
+        prompt += f"\n\nRISK INTELLIGENCE (from pre-analysis):\n{risk_context}"
+
     if execution_context:
         prompt += f"\n\nREFLECTION CONTEXT (PREVIOUS FAILURE):\n{json.dumps(execution_context, indent=2)}\n Please refine the plan based on this failure."
 

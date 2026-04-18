@@ -168,3 +168,76 @@ This document catalogs all known failure modes in the ShopWave multi-agent custo
 > A system that fails and recovers is a system that's production-ready."
 
 Every failure mode has a handler. Every handler produces auditable output. No ticket is ever silently dropped. The dead-letter queue ensures nothing is lost, and the audit log provides complete observability into every decision.
+
+---
+
+## 6. Risk Intelligence Failures (v2.0)
+
+### 6.1 VIP Claim Mismatch
+- **What**: Customer claims VIP status that doesn't match database tier
+- **Detection**: `risk_analyzer.py` cross-references ticket claims vs. actual `customer.tier`
+- **Recovery**: Flag as potential social engineering, reduce confidence, escalate
+- **Log event**: `DECISION` with `THREAT_DETECTED` / social_engineering signal
+
+### 6.2 Threat Detection False Positive
+- **What**: Legitimate customer uses words that match threat patterns (e.g., "legal" in a legal product inquiry)
+- **Detection**: Risk score elevated but execution succeeds normally
+- **Recovery**: System still processes normally — threat flags are advisory, not blocking (unless risk_score >= 85)
+- **Impact**: Slightly elevated priority handling, no negative customer experience
+
+### 6.3 Fraud Over-Flagging
+- **What**: New customer with 1 order flagged for NEW_ACCOUNT fraud pattern on a legitimate inquiry
+- **Detection**: `_detect_fraud_patterns()` flags based on order count
+- **Recovery**: Flag is advisory — adds to risk score but doesn't block execution. Only critical scores (85+) trigger auto-escalation
+- **Mitigation**: Threshold-based scoring prevents false positives from blocking legitimate requests
+
+### 6.4 Post-Execution Refund Anomaly
+- **What**: Refund amount processed exceeds original order amount
+- **Detection**: `analyze_post_execution()` compares `refund_amount` vs. `order_amount` from execution context
+- **Recovery**: Fraud flag `REFUND_AMOUNT_MISMATCH` added, risk score increased by 40 points
+- **Log event**: `DECISION` with `POST_EXEC_RISK` flag
+
+---
+
+## 7. Dynamic Value Resolution Failures (v2.0)
+
+### 7.1 Unresolvable Step Reference
+- **What**: Plan references `step_5_result.amount` but step 5 hasn't executed yet or failed
+- **Detection**: `_resolve_dynamic_reference()` returns `None` — value passes through unchanged
+- **Recovery**: MCP tool receives the raw string, likely fails, triggers retry/reflection
+- **Impact**: Falls back to reflection loop (same as v1 behavior — graceful degradation)
+
+### 7.2 Type Coercion on Non-Numeric String
+- **What**: `amount` field contains `"not available"` instead of a number
+- **Detection**: `_coerce_type()` catches `ValueError` during float conversion
+- **Recovery**: Value passed through as-is, MCP tool handles the error
+- **Impact**: Tool returns error, executor retries, then reflection fixes if needed
+
+### 7.3 Duplicate Ticket Processing
+- **What**: Same ticket ID appears twice in input batch
+- **Detection**: `PROCESSED_TICKETS` set in orchestrator checks before processing
+- **Recovery**: Second instance immediately returns with `intent: duplicate_skip` and `confidence: 1.0`
+- **Log event**: `DECISION` with `SKIP_DUPLICATE`
+
+---
+
+## 8. Failure Recovery Matrix (Updated)
+
+| Failure Type | Detection | Recovery | Worst Case |
+|---|---|---|---|
+| Tool timeout | `TimeoutError` | 3x retry + backoff | Step fails → reflection |
+| Malformed response | Schema validation | Retry | Step fails → reflection |
+| Low confidence | Threshold check | Force escalation | Human handles ticket |
+| Bad plan | Validator rules | Fix or re-plan | Dead-letter queue |
+| Execution failure | Result check | Reflection loop | Dead-letter queue |
+| LLM failure | Exception catch | Fallback templates | Degraded but functional |
+| Total failure | All loops exhausted | Dead-letter queue | Manual review required |
+| Policy violation | Validator + rules | Reject + re-plan | Escalation |
+| Social engineering | Tier verification | Flag + decline | Escalation to fraud team |
+| **VIP detection** | Risk analyzer | Apply privileges | Extended return window |
+| **Threat language** | Regex patterns | Flag + priority bump | Supervisor escalation |
+| **Fraud pattern** | Heuristic scoring | Advisory flag | Auto-escalate at score ≥85 |
+| **Type mismatch** | Coercion engine | Auto-convert string→number | Fallback to reflection |
+| **Dynamic ref fail** | Resolver returns None | Pass through; tool errors → retry | Reflection loop fixes it |
+| **Duplicate ticket** | Set-based guard | Skip with logged decision | No wasted LLM calls |
+

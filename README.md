@@ -1,25 +1,31 @@
 # 🛒 ShopWave Multi-Agent Customer Support System
 
-> A production-grade, fault-tolerant multi-agent system using **Google ADK + MCP** for automated customer support ticket resolution.
+> A production-grade, self-correcting multi-agent system using **MCP + LLM** for autonomous customer support ticket resolution.
 > Built for the **Ksolves Agentic AI Hackathon 2026**.
 
-## Architecture
+---
+
+## 🏗️ Architecture
+
+![Architecture Diagram](architecture.png)
 
 ```
-Ticket → Planner Agent → Validator Agent → Executor (MCP) → Responder Agent → Audit Log
-              ↑                                    |
-              └──── Reflection Loop (on failure) ──┘
+Ticket → Risk Analysis → Planner Agent → Validator Agent → Executor (MCP) → Post-Exec Risk → Responder → Audit Log
+                ↑               ↑                                    |
+                │               └──── Reflection Loop (on failure) ──┘
+                └── VIP / Fraud / Threat Intelligence ──────────────────
 ```
 
 ### Agent Pipeline
 
 | Agent | Role | Model |
 |---|---|---|
-| **Planner** | Classifies intent, estimates confidence, generates step-by-step execution plans | Gemini 2.0 Flash |
-| **Validator** | Reviews plans for safety, ShopWave policy compliance, correct ordering. Can reject/fix plans | Gemini 2.0 Flash |
-| **Executor** | Runs MCP tool calls with retry logic (3x exponential backoff) | N/A (tool runner) |
-| **Responder** | Generates human-like ShopWave customer replies following tone guidelines | Gemini 2.0 Flash |
-| **Orchestrator** | Coordinates all agents, manages reflection loops, dead-letter queue | N/A (pipeline) |
+| **Risk Analyzer** | Pre-execution risk scoring: VIP detection, fraud patterns, threat language, policy adjustments | Rule-based engine |
+| **Planner** | Classifies intent, estimates confidence, generates risk-aware execution plans | Gemini 2.5 Flash |
+| **Validator** | Reviews plans for safety, ShopWave policy compliance, tool ordering. Can reject/fix plans | Gemini 2.5 Flash |
+| **Executor** | Runs MCP tool calls with dynamic value resolution, type coercion, and retry logic | N/A (tool runner) |
+| **Responder** | Generates human-like ShopWave customer replies following tone guidelines | Gemini 2.5 Flash |
+| **Orchestrator** | Coordinates all agents, manages reflection loops, dead-letter queue, duplicate guard | N/A (pipeline) |
 
 ### MCP Tools (ShopWave APIs)
 
@@ -31,7 +37,7 @@ Ticket → Planner Agent → Validator Agent → Executor (MCP) → Responder Ag
 | `get_product` | Retrieve product info (warranty, return window) | 8% |
 | `get_orders_by_customer` | Find all orders for a customer | 10% |
 | `check_refund_eligibility` | Check if order qualifies for refund | 18% |
-| `issue_refund` | Process a refund | 20% |
+| `issue_refund` | Process a refund (IRREVERSIBLE) | 20% |
 | `cancel_order` | Cancel order (processing status only) | 10% |
 | `search_knowledge_base` | Search ShopWave KB (policies, FAQs) | 5% |
 | `send_reply` | Send reply to customer | 8% |
@@ -39,18 +45,28 @@ Ticket → Planner Agent → Validator Agent → Executor (MCP) → Responder Ag
 
 > Tools simulate real-world conditions: random timeouts, 503 errors, and malformed responses.
 
-## Key Features
+## ✨ Key Features
 
-- **🔄 Reflection Loop**: On execution failure, planner re-plans with failure context (max 2 loops)
-- **🛡️ Validator**: Catches unsafe plans (e.g., refund without eligibility check, social engineering)
+### Core Agent Capabilities
+- **🔄 Self-Healing Reflection Loop**: On execution failure, planner re-plans with root cause context (max 2 loops)
+- **🛡️ Intelligent Validator**: Catches unsafe plans (refund without eligibility check, social engineering)
 - **📊 Confidence Calibration**: Plans below 0.6 confidence → auto-escalate
 - **📬 Dead-Letter Queue**: Failed tickets preserved for manual review
-- **📝 Audit Log**: Every thought, action, decision, and error logged to JSON
-- **⚡ Concurrency**: `asyncio.gather()` for parallel ticket processing
-- **🔁 Retry System**: 3x exponential backoff on tool failures
-- **🏷️ Policy-Aware**: Understands ShopWave return windows, tier privileges, warranty rules
+- **📝 Full Audit Trail**: Every thought, action, decision, and error logged to JSON
+- **⚡ Concurrent Processing**: `asyncio.gather()` for parallel ticket processing
+- **🔁 3x Exponential Retry**: Backoff on tool failures with timeout protection
 
-## Quick Start
+### v2.0 — Production Hardening
+- **🛡️ Risk & Policy Intelligence**: Pre-execution risk analysis with VIP detection, fraud pattern matching, threat language scanning
+- **🔍 Dynamic Value Resolution**: Executor automatically resolves `step_2_result.amount` → `129.99` (no more reflection dependency)
+- **🔢 Type Coercion**: `"129.99"` (string) → `129.99` (float) for numeric parameters
+- **🎯 Fuzzy Tool Mapping**: Handles 50+ LLM hallucination patterns (`send_message` → `send_reply`)
+- **🚫 Duplicate Ticket Guard**: Prevents re-processing of already-handled tickets
+- **👑 VIP Privilege Engine**: Tier-aware return window extensions and priority handling
+- **🔴 Threat Detection**: Hostile/legal language → flag + escalation priority
+- **📈 Post-Execution Risk Check**: Fraud detection on refund amounts after execution
+
+## 🚀 Quick Start
 
 ### 1. Install Dependencies
 
@@ -62,13 +78,19 @@ pip install -r requirements.txt
 
 ### 2. Configure API Key
 
-Edit `.env` and set your Google AI API key:
+Copy the example env file and add your keys:
+
+```bash
+copy .env.example .env      # Windows
+# Then edit .env with your actual API keys
+```
 
 ```
 GOOGLE_API_KEY=your-actual-api-key
+GROQ_API_KEY=your-groq-api-key
 ```
 
-### 3. Run
+### 3. Run the Agent
 
 ```bash
 # Process all 20 hackathon tickets
@@ -84,32 +106,53 @@ python main.py --verbose --limit 5
 python main.py --sequential
 ```
 
-## Data (Official Hackathon Data)
+### 4. Launch Dashboard
+
+```bash
+# Real-time audit visualization with risk intelligence
+uvicorn dashboard:app --reload
+# Open http://localhost:8000
+```
+
+### 5. Docker Deployment (Bonus)
+
+The system includes full Docker support for containerized execution.
+
+```bash
+# Build and run both the agent and dashboard services
+docker compose up --build
+
+# Open http://localhost:8000 to see live results
+# The agent will automatically process the 20 tickets in rate-limit-safe batches.
+```
+
+## 📋 Data (Official Hackathon Data)
 
 All data sourced from the official `ksolves/agentic_ai_hackthon_2026_sample_data` repo:
 
 | File | Contents |
 |---|---|
-| `data/tickets.json` | 20 support tickets (varying complexity tiers 1-3) |
-| `data/customers.json` | 10 customers (standard, premium, VIP tiers) |
-| `data/orders.json` | 15 orders (processing, shipped, delivered) |
-| `data/products.json` | 8 products (electronics, footwear, home, sports) |
-| `data/knowledge-base.md` | ShopWave policies (returns, refunds, warranty, escalation) |
+| `hackathon_data/tickets.json` | 20 support tickets (varying complexity tiers 1-3) |
+| `hackathon_data/customers.json` | 10 customers (standard, premium, VIP tiers) |
+| `hackathon_data/orders.json` | 15 orders (processing, shipped, delivered) |
+| `hackathon_data/products.json` | 8 products (electronics, footwear, home, sports) |
+| `hackathon_data/knowledge-base.md` | ShopWave policies (returns, refunds, warranty, escalation) |
 
-## Project Structure
+## 📁 Project Structure
 
 ```
 ├── agent/
-│   ├── planner.py          # Intent classification + plan generation
-│   ├── validator.py        # Plan validation + safety checks
+│   ├── planner.py          # Intent classification + risk-aware plan generation
+│   ├── validator.py        # Plan validation + safety checks + deterministic rules
+│   ├── executor.py         # MCP tool execution with dynamic resolution + retries
+│   ├── risk_analyzer.py    # VIP detection, fraud patterns, threat scanning
 │   ├── responder.py        # ShopWave customer reply generation
-│   ├── executor.py         # MCP tool execution with retries
-│   ├── orchestrator.py     # Pipeline coordination + reflection
+│   ├── orchestrator.py     # Pipeline coordination + reflection + duplicate guard
 │   └── audit_logger.py     # Comprehensive audit logging
 ├── mcp_server/
-│   ├── server.py           # FastMCP server with 11 tools
+│   ├── server.py           # FastMCP server with 11 tools + realistic failure sim
 │   └── schemas.py          # Pydantic models for I/O
-├── data/                   # Official hackathon data
+├── hackathon_data/         # Official hackathon data
 │   ├── tickets.json
 │   ├── customers.json
 │   ├── orders.json
@@ -119,27 +162,54 @@ All data sourced from the official `ksolves/agentic_ai_hackthon_2026_sample_data
 │   ├── audit_log.json      # Generated audit trail
 │   └── results_summary.json
 ├── config.py               # Configuration & thresholds
-├── main.py                 # Entry point
-├── failure_modes.md        # Failure documentation
+├── main.py                 # Entry point (single command)
+├── dashboard.py            # Real-time Intel Dashboard v2.0
+├── architecture.png        # System architecture diagram
+├── failure_modes.md        # Failure documentation (9+ scenarios)
+├── .env.example            # API key template (safe to commit)
 └── requirements.txt
 ```
 
-## Design Philosophy
+## 🧠 Design Philosophy
 
-> "We designed a multi-agent system with a planner-validator loop, MCP-based tool execution, and a fault-tolerant orchestration layer."
+> *"Our system doesn't just execute tasks — it detects failures, understands root causes, and autonomously corrects its behavior in real time."*
 
 1. **Fail intentionally**: MCP tools have realistic failure rates (5-20%). The agent must handle it.
 2. **Validate everything**: Validator catches unsafe plans before execution.
-3. **Reflect on failure**: Planner re-plans using failure context instead of giving up.
+3. **Reflect on failure**: Planner re-plans using root cause context instead of giving up.
 4. **Never lose data**: Dead-letter queue preserves unresolvable tickets.
-5. **Log everything**: Audit trail proves the agent's intelligence and decision-making.
-6. **Policy-aware**: System understands ShopWave's tiered return windows, warranty policies, and escalation guidelines.
+5. **Know your risk**: Pre-execution risk analysis flags VIPs, threats, and fraud before any action.
+6. **Resolve dynamically**: Executor resolves inter-step references automatically — no reflection dependency.
+7. **Log everything**: Audit trail proves the agent's intelligence and decision-making.
 
-## Tech Stack
+## 🛡️ Risk Intelligence (v2.0)
 
-- **Framework**: Google ADK (Agent Development Kit)
+The system includes a dedicated Risk & Policy Intelligence engine that runs before AND after execution:
+
+| Capability | Description |
+|---|---|
+| **VIP Detection** | Identifies Tier 2/3 customers, applies extended return windows |
+| **Fraud Patterns** | High-value refund alerts, new account flags, velocity checks |
+| **Threat Scanner** | Detects hostile/legal language, social engineering attempts |
+| **Policy Engine** | Tier-aware adjustments (VIP: +15 days, Premium: +7 days) |
+| **Post-Exec Audit** | Verifies refund amounts, flags anomalies after execution |
+
+## ⚙️ Tech Stack
+
 - **Tools Protocol**: MCP (Model Context Protocol) via FastMCP
-- **LLM**: Google Gemini 2.0 Flash
+- **LLM**: Google Gemini 2.5 Flash / Groq (configurable)
 - **Language**: Python 3.11+
 - **Async**: asyncio for concurrency
+- **Dashboard**: FastAPI + vanilla JS (real-time polling)
 - **Validation**: Pydantic for schema enforcement
+- **Retry**: tenacity for exponential backoff
+
+## 📊 Scoring Alignment
+
+| Criteria (100 pts) | Implementation |
+|---|---|
+| **Production Readiness (30)** | Modular agents, 3x retry, dead-letter queue, risk engine, audit logging |
+| **Engineering Depth (30)** | Concurrent processing, realistic mocks (5-20% failure), dynamic resolution, type coercion |
+| **Presentation (20)** | Real-time Intel Dashboard v2.0 with risk visualization |
+| **Agentic Design (10)** | 5-agent pipeline, reflection loops, confidence-based escalation |
+| **Self-Awareness (10)** | Risk scoring, threat detection, fraud flags, confidence calibration |

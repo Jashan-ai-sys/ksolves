@@ -299,8 +299,14 @@ def _validate_tool_output(tool: str, data: dict) -> bool:
 
 def _resolve_context_params(params: dict, context: dict) -> dict:
     """
-    Replace context references in params with actual values.
-    Handles {{var}} syntax and STEP_X_FROM_Z variations used by LLMs.
+    Replace context references in params with actual values from execution context.
+
+    Handles:
+    - {{mustache}} syntax: "{{customer_id}}" → "CUST-001"
+    - Dynamic step references: "step_2_result.amount" → 129.99
+    - Dotted path resolution: "step_1.data.customer_id" → "CUST-001"
+    - LLM hallucination patterns: "CUSTOMER_ID_FROM_STEP_1" → "CUST-001"
+    - Type coercion for known numeric fields (amount, price, etc.)
     """
     resolved = {}
     for key, value in params.items():
@@ -311,26 +317,155 @@ def _resolve_context_params(params: dict, context: dict) -> dict:
                     tag = f"{{{{{ctx_key}}}}}"
                     if tag in value:
                         value = value.replace(tag, str(ctx_val))
-            
-            # 2. Handle LLM hallucination patterns (e.g., 'CUSTOMER_ID_FROM_STEP_1')
-            upper_val = value.upper()
-            if "FROM_STEP" in upper_val or "STEP_" in upper_val:
-                # Resolve Customer ID
-                if "CUSTOMER_ID" in upper_val:
-                    value = str(context.get("customer_id", value))
-                # Resolve Order ID
-                elif "ORDER_ID" in upper_val:
-                    value = str(context.get("order_id", value))
-                # Resolve Product ID
-                elif "PRODUCT_ID" in upper_val:
-                    value = str(context.get("product_id", value))
-            
+
+            # 2. Dynamic step reference resolution (the CRITICAL FIX)
+            #    Patterns: "step_2_result.amount", "step_1_result.data.customer_id"
+            resolved_val = _resolve_dynamic_reference(value, context)
+            if resolved_val is not None:
+                value = resolved_val
+
+            # 3. Handle LLM hallucination patterns (e.g., 'CUSTOMER_ID_FROM_STEP_1')
+            if isinstance(value, str):
+                upper_val = value.upper()
+                if "FROM_STEP" in upper_val or ("STEP_" in upper_val and "result" not in value.lower()):
+                    # Resolve Customer ID
+                    if "CUSTOMER_ID" in upper_val:
+                        value = str(context.get("customer_id", value))
+                    # Resolve Order ID
+                    elif "ORDER_ID" in upper_val:
+                        value = str(context.get("order_id", value))
+                    # Resolve Product ID
+                    elif "PRODUCT_ID" in upper_val:
+                        value = str(context.get("product_id", value))
+
+            # 4. Type coercion for known numeric fields
+            value = _coerce_type(key, value)
+
             resolved[key] = value
         elif isinstance(value, dict):
             resolved[key] = _resolve_context_params(value, context)
         else:
             resolved[key] = value
     return resolved
+
+
+def _resolve_dynamic_reference(value: str, context: dict) -> Any:
+    """
+    Resolve dynamic step references to actual values from execution context.
+
+    Supports:
+    - "step_2_result.amount" → context["step_2"]["data"]["amount"] or context["step_2"]["amount"]
+    - "step_1.data.customer_id" → traverses nested dicts
+    - "step_3_result.eligible" → context["step_3"]["data"]["eligible"]
+    - Direct context key references: "order_amount" → context["order_amount"]
+    """
+    if not isinstance(value, str):
+        return None
+
+    # Pattern 1: step_X_result.field (most common LLM pattern)
+    match = __import__('re').match(r'^step_(\d+)_result\.(.+)$', value, __import__('re').IGNORECASE)
+    if match:
+        step_num = match.group(1)
+        field_path = match.group(2)  # e.g., "amount" or "data.customer_id"
+        step_key = f"step_{step_num}"
+
+        step_data = context.get(step_key)
+        if step_data is not None:
+            resolved = _traverse_path(step_data, field_path)
+            if resolved is not None:
+                print(f"  [RESOLVER]: step_{step_num}_result.{field_path} → {resolved}")
+                return resolved
+
+    # Pattern 2: step_X.field
+    match = __import__('re').match(r'^step_(\d+)\.(.+)$', value, __import__('re').IGNORECASE)
+    if match:
+        step_num = match.group(1)
+        field_path = match.group(2)
+        step_key = f"step_{step_num}"
+
+        step_data = context.get(step_key)
+        if step_data is not None:
+            resolved = _traverse_path(step_data, field_path)
+            if resolved is not None:
+                print(f"  [RESOLVER]: step_{step_num}.{field_path} → {resolved}")
+                return resolved
+
+    # Pattern 3: tool_name_result.field (e.g., "get_order_result.amount")
+    match = __import__('re').match(r'^(\w+)_result\.(.+)$', value, __import__('re').IGNORECASE)
+    if match:
+        tool_key = match.group(1) + "_result"
+        field_path = match.group(2)
+        tool_data = context.get(tool_key)
+        if tool_data is not None:
+            resolved = _traverse_path(tool_data, field_path)
+            if resolved is not None:
+                print(f"  [RESOLVER]: {tool_key}.{field_path} → {resolved}")
+                return resolved
+
+    # Pattern 4: Direct context key lookup (e.g., value IS a context key)
+    if value in context and not value.startswith("step_"):
+        resolved = context[value]
+        if resolved is not None:
+            print(f"  [RESOLVER]: direct key '{value}' → {resolved}")
+            return resolved
+
+    return None
+
+
+def _traverse_path(data: Any, dotted_path: str) -> Any:
+    """
+    Traverse a nested dict/object using a dotted path.
+    e.g., "data.customer_id" on {"data": {"customer_id": "C001"}} → "C001"
+
+    Also checks the 'data' sub-key automatically (MCP tools wrap in {"success": true, "data": {...}})
+    """
+    parts = dotted_path.split(".")
+    current = data
+
+    for part in parts:
+        if isinstance(current, dict):
+            if part in current:
+                current = current[part]
+            elif "data" in current and isinstance(current["data"], dict):
+                # Auto-unwrap MCP-style {"success": true, "data": {...}} responses
+                current = current["data"].get(part)
+                if current is None:
+                    return None
+            else:
+                return None
+        else:
+            return None
+
+    return current
+
+
+# Known numeric parameter names — these should always be numbers, not strings
+NUMERIC_PARAMS = {"amount", "price", "refund_amount", "quantity", "total", "max_amount", "credit"}
+
+
+def _coerce_type(key: str, value: Any) -> Any:
+    """
+    Coerce parameter types based on known field semantics.
+    Prevents 'unable to parse string as number' errors.
+    """
+    if not isinstance(value, str):
+        return value
+
+    # Numeric coercion for known fields
+    if key.lower() in NUMERIC_PARAMS:
+        try:
+            # Remove currency symbols and commas
+            clean = value.replace("$", "").replace(",", "").strip()
+            if "." in clean:
+                coerced = float(clean)
+            else:
+                coerced = int(clean)
+            print(f"  [COERCE]: {key} '{value}' → {coerced} (string→number)")
+            return coerced
+        except (ValueError, TypeError):
+            pass  # Not a number string, leave as-is
+
+    return value
 
 
 def _extract_context(context: dict, tool: str, data: dict) -> None:

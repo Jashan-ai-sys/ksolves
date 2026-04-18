@@ -2,12 +2,18 @@
 Orchestrator — Master pipeline coordinating all ShopWave support agents.
 
 Flow:
-    Ticket → Planner → Validator → (fix plan if needed) → Executor → Responder → Logger
+    Ticket → Risk Analysis → Planner → Validator → (fix plan if needed) → Executor → 
+    Post-Execution Risk Check → Responder → Logger
 
 Features:
+- Pre-execution risk & policy intelligence
+- Post-execution fraud/anomaly detection
+- VIP customer privilege application
+- Threat/abuse language detection
 - Confidence-based escalation
 - Reflection loop (re-plan on failure, up to MAX_REFLECTION_LOOPS)
 - Dead-letter queue for unresolvable tickets
+- Duplicate ticket guard
 - Concurrent ticket processing via asyncio.gather()
 - Full audit trail
 """
@@ -25,11 +31,20 @@ from agent.validator import run_validator
 from agent.responder import run_responder
 from agent.executor import execute_plan
 from agent.audit_logger import logger
+from agent.risk_analyzer import (
+    analyze_ticket_risk,
+    analyze_post_execution,
+    get_risk_summary_for_planner,
+    RiskAnalysis,
+)
 from config import CONFIDENCE_THRESHOLD, MAX_REFLECTION_LOOPS, MAX_CONCURRENT_TICKETS, TIER_PRIORITY
 
 
 # Dead-letter queue for tickets that cannot be resolved
 DEAD_LETTER_QUEUE: list[dict] = []
+
+# Processed ticket tracking — prevents duplicate processing
+PROCESSED_TICKETS: set[str] = set()
 
 # MCP Server connection parameters — points to our ShopWave MCP server
 MCP_SERVER_PARAMS = StdioServerParameters(
@@ -42,14 +57,75 @@ async def process_ticket(ticket: dict) -> dict:
     """
     Process a single support ticket through the full agent pipeline.
 
-    Pipeline: Planner → Validator → Executor → Responder → Logger
+    Pipeline: Risk Analysis → Planner → Validator → Executor →
+              Post-Execution Risk Check → Responder → Logger
     With reflection loop on failure.
     """
     ticket_id = ticket.get("ticket_id", "UNKNOWN")
     start_time = time.time()
 
+    # ─── DUPLICATE GUARD ────────────────────────────
+    if ticket_id in PROCESSED_TICKETS:
+        print(f"  [GUARD]: ⚠️ Ticket {ticket_id} already processed — skipping duplicate")
+        logger.log_decision("orchestrator", "SKIP_DUPLICATE", f"Ticket {ticket_id} already processed")
+        return {
+            "ticket_id": ticket_id,
+            "success": True,
+            "intent": "duplicate_skip",
+            "confidence": 1.0,
+            "plan_steps": 0,
+            "completed_steps": 0,
+            "reflection_loops": 0,
+            "escalated": False,
+            "expected_action": ticket.get("expected_action", "N/A"),
+            "response": "This ticket was already processed.",
+            "response_tone": "informative",
+            "follow_up_needed": False,
+            "execution_details": None,
+            "duration_ms": 0,
+            "risk_analysis": None,
+        }
+    PROCESSED_TICKETS.add(ticket_id)
+
     logger.start_ticket(ticket_id, ticket)
     logger.log_thought("orchestrator", f"Starting processing for ticket {ticket_id}: {ticket.get('subject', 'N/A')}")
+
+    # ─── STEP 0: PRE-EXECUTION RISK ANALYSIS ────────
+    risk_analysis = analyze_ticket_risk(ticket)
+    logger.log_thought("risk_analyzer", f"Risk assessment complete: score={risk_analysis.risk_score}/100, level={risk_analysis.risk_level}", {
+        "risk_score": risk_analysis.risk_score,
+        "risk_level": risk_analysis.risk_level,
+        "threat_detected": risk_analysis.threat_detected,
+        "fraud_flags": risk_analysis.fraud_flags,
+        "signals": [s["signal"] for s in risk_analysis.signals],
+        "policy_adjustments": risk_analysis.policy_adjustments,
+        "recommendations": risk_analysis.recommendations,
+    })
+
+    if risk_analysis.vip_context:
+        logger.log_decision(
+            "risk_analyzer", "VIP_DETECTED",
+            f"Tier {risk_analysis.vip_context['tier']} ({risk_analysis.vip_context['tier_name']}) — applying privileges",
+            risk_analysis.vip_context
+        )
+
+    if risk_analysis.threat_detected:
+        logger.log_decision(
+            "risk_analyzer", "THREAT_DETECTED",
+            "Hostile/threatening language detected — flagging for careful handling",
+            {"signals": [s for s in risk_analysis.signals if s["category"] == "threat"]}
+        )
+
+    # Risk-based auto-escalation for critical scores
+    if risk_analysis.should_escalate and risk_analysis.risk_score >= 85:
+        logger.log_decision(
+            "risk_analyzer", "RISK_ESCALATION",
+            f"Critical risk score {risk_analysis.risk_score}/100 — recommending escalation",
+            {"escalation_reason": risk_analysis.escalation_reason}
+        )
+
+    # Generate risk context string for the planner
+    risk_context_str = get_risk_summary_for_planner(risk_analysis)
 
     execution_context = None
     final_result = None
@@ -76,7 +152,11 @@ async def process_ticket(ticket: dict) -> dict:
         # ─── STEP 1: PLANNER ────────────────────────
         try:
             logger.log_action("orchestrator", "invoke_planner", {"reflection": is_reflection})
-            plan = await run_planner(ticket, execution_context if is_reflection else None)
+            plan = await run_planner(
+                ticket,
+                execution_context if is_reflection else None,
+                risk_context=risk_context_str,
+            )
             logger.log_thought("planner", plan.get("reasoning", "No reasoning provided"), {
                 "intent": plan.get("intent"),
                 "confidence": plan.get("confidence"),
@@ -208,6 +288,15 @@ async def process_ticket(ticket: dict) -> dict:
                     "last_execution": execution_result
                 })
 
+        # ─── STEP 5.5: POST-EXECUTION RISK CHECK ────
+        risk_analysis = analyze_post_execution(risk_analysis, execution_result, ticket)
+        if risk_analysis.risk_score > 50:
+            logger.log_decision(
+                "risk_analyzer", "POST_EXEC_RISK",
+                f"Post-execution risk elevated: {risk_analysis.risk_score}/100",
+                {"fraud_flags": risk_analysis.fraud_flags, "signals": risk_analysis.signals[-3:]}
+            )
+
         # ─── STEP 6: RESPONDER ──────────────────────
         try:
             logger.log_action("orchestrator", "invoke_responder")
@@ -245,6 +334,7 @@ async def process_ticket(ticket: dict) -> dict:
             "response_tone": response.get("tone", "professional"),
             "follow_up_needed": response.get("follow_up_needed", False),
             "execution_details": execution_result,
+            "risk_analysis": risk_analysis.to_dict(),
             "duration_ms": round(duration_ms, 2),
         }
         break
@@ -291,7 +381,7 @@ async def process_tickets_concurrent(tickets: list[dict], max_concurrent: int = 
                 ticket_id = ticket.get("ticket_id", "UNKNOWN")
                 
                 # Stagger requests to avoid Groq rate limits
-                await asyncio.sleep(worker_id * 3.0)
+                await asyncio.sleep(worker_id * 5.0)
                 
                 logger.log_thought("orchestrator", f"Worker {worker_id} picked up ticket {ticket_id}")
                 
